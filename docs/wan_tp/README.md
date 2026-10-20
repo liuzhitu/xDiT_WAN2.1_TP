@@ -1,12 +1,12 @@
 # xDiT 原生 Wan TP 接入：FFN、SelfAttention 与文本 CrossAttention
 
-状态：源码已编辑，尚未执行云端正确性或性能验证。当前 Wan DiT 的 FFN、SelfAttention 和文本 CrossAttention 均已接入 TP，embedding、普通归一化、调制和最终输出 head 仍复制。已编写 TP×USP 的组成员适配及 TP×DP 输出去重；不能将源码接入表述为正确性或性能验证通过。
+状态（2026-10-20）：Wan2.1-T2V-1.3B 已完成四卡 TP 性能采集，并通过 TP2×Ulysses2、TP2×Ring2、TP2×DP2 的短流程端到端兼容性检查。DiT 加速 1.52×、生成流水线加速 1.51×；单卡数值对照仍为 metrics_only。详见 [云端实测记录](results.md)。以下设计说明保留实现时的约束，未列入实测的组合不能视为已验证。
 
 ## 参考版本与交付方式
 
 - xDiT：`97a4425c68071e1fdf04d40f468015d30be60f41`。
 - 独立源码项目：`D:/研究生/ai_infra/xdit-wan-tp`；GitHub fork：`https://github.com/liuzhitu/xDiT_WAN2.1_TP`；实现分支：`codex/wan21-tp`。
-- Diffusers Wan/FFN/Attention 结构阅读参考：`v0.35.2`；PyTorch RMSNorm 数值顺序参考：`v2.8.0`。这些不是已安装环境的版本声明。正式云端运行前仍需确定 Diffusers、YunChang 和模型 checkpoint 的具体版本。
+- Diffusers Wan/FFN/Attention 结构阅读参考：`v0.35.2`；PyTorch RMSNorm 数值顺序参考：`v2.8.0`。这些是设计阅读参考；实际云端依赖、模型 revision 和运行 SHA 见 [实测记录](results.md)。
 - 交付方式：本 fork 的 `codex/wan21-tp` 分支直接保存完整源码及修改历史，基于上述固定 commit。旧 `wan_parallel` 仓库中的累计补丁保留为迁移备份，不需要在本分支上重复应用。
 
 恢复实现时，clone 本 fork 并检出 `codex/wan21-tp` 的指定提交；原生对照则使用上游固定 commit。记录两种源码的 SHA，使用相同环境和权重。继续从 xDiT 原生 `xdit` / `xfuser.runner` 入口运行，不增加自定义推理入口。
@@ -49,7 +49,7 @@ CrossAttention：视频 Q `[B,S,D/P]` 与完整文本 context 投影的 K/V `[B,
 
 ## 本阶段兼容范围
 
-本阶段允许原生 TP 参数选择 FFN + SelfAttention + 文本 CrossAttention TP，并移除早期 TP×SP 禁止条件。全部条目均未运行验证：
+本阶段允许原生 TP 参数选择 FFN + SelfAttention + 文本 CrossAttention TP，并移除早期 TP×SP 禁止条件。TP4 及 TP2×Ulysses2 / Ring2 / DP2 已完成的运行范围见 [实测记录](results.md)，其余组合仍待验证：
 
 | 组合 | 源码处理与边界 |
 |---|---|
@@ -80,13 +80,11 @@ Wan wrapper 在补齐前取得实际视频 token 数，每次 forward 更新 Sel
 
 ## 验证与后续工作
 
-本轮只进行了源码阅读、编辑与人工 diff 审阅。没有运行语法编译、import、lint、CPU/GPU 测试或模型推理，也没有新增验证脚本。
+2026-10-19 已完成 1.3B 的单卡 / TP4 性能采集和三项 TP2 混合并行短流程检查。TP4 采集的首步 DiT 输出与最终 latent 在 TP ranks 间零误差一致；相对单卡仍为 metrics_only，最终 latent relative L2=0.258719，没有数值验收通过结论。输入、计时、依赖与结果见 [云端实测记录](results.md)。
 
-云端计划仅验证 1.3B。尚需证明：FFN/head 分片覆盖完整通道、非零 Row bias 恰好贡献一次、Q/K RMSNorm 覆盖全维且遵循参考 dtype 顺序、RoPE/head 排列正确、归约后的输出在 TP 组内一致，并与同版本原生 xDiT 单卡在明确 dtype 下数值对齐。应使用不同 TP 分片幅度的 Q/K 输入，避免本地归一化错误被相同统计量掩盖。整条原生 runner 路径、offload/compile、融合回退和内存释放也尚未实际验证。14B 的模型接入与分片路径已纳入源码范围，但未运行验证；1.3B 的验证结果不能表述为 14B 已验证。14B 仍须满足完整 Transformer 加载阶段的资源需求。
+仍需分别覆盖：分层数值误差定位、明确容差的单卡对齐、81 帧混合并行对照、混合 USP、视频 padding 的各类尾块、连续请求和进程内重新初始化、共享 ranks 的并行 VAE，以及 offload / compile / cache 等配置。14B 共用接入实现但未实测；不能由 1.3B 结果推断其验证状态。
 
-CrossAttention 尚需对齐视频与文本长度不同的输入、正负文本条件，以及原生文本处理后的 K/V。其 Q 统计形状是 `[B,S,1]`，K 统计形状是 `[B,Ltext,1]`；两者必须保持独立且各 TP rank 的输入一致。本阶段只记录验证目标，没有新增验证脚本或执行命令。
-
-组合验证还须覆盖：TP2×Ring2、TP2×Ulysses2、可整除 heads 的混合 USP、加入 DP 后不同 prompts 的输出数量、子组销毁/重新初始化，以及共享 ranks 的并行 VAE。视频 padding 须分别覆盖无 padding、部分有效尾块、纯 Ulysses 含全 padding 的原始分片、Ring 完全无效块明确失败，以及连续请求在有/无 padding 间切换。应确认 Ring 计算裁剪不改变通信形状、padding K/V 不贡献 softmax、输出无 NaN，且 TP=1/TP>1 都与同版本单卡数值对齐。12 heads、TP2×Ulysses4 应明确失败。适配结构虽保留 CFG/PP 维度，本阶段 Wan T2V 不运行 CFG/PP。上述均待云端执行。
+本次仅整理已有云端结果与文档，在本机未运行编译、import、lint、CPU/GPU 测试或推理，未新增验证脚本。
 
 ## 推荐阅读位置
 
@@ -95,3 +93,4 @@ CrossAttention 尚需对齐视频与文本长度不同的输入、正负文本�
 3. `models/transformers/wan_tp.py::parallelize_wan_attention`：理解 TP×Ulysses heads 约束与 CrossAttention 差异。
 4. `models/transformers/transformer_wan.py::forward`：理解实际视频长度、原生序列/RoPE 切分与 Head 后 gather。
 5. `layers/usp.py::_ring_trim_trailing_kv_padding` 与 `USP`：理解 Ulysses 交换后裁剪、Ring 每步块来源，以及完全无效块的拒绝边界。
+
